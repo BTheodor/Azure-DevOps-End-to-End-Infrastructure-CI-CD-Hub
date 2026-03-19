@@ -48,3 +48,6 @@ State is managed via an Azure Storage Account container with locking enabled.
 3. **Pipeline Execution:**
    - Register the YAML pipeline located at `pipelines/azure-pipelines.yml` in Azure DevOps.
    - Run the pipeline to build, scan (tfsec), provision infrastructure, and deploy the app.
+  
+   Author
+   Theodor B.
