@@ -1,0 +1,112 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: dev-vg # Assume variable group with terraform state details and Azure RM service connection
+  - name: tf_working_dir
+    value: '$(System.DefaultWorkingDirectory)/infra'
+  - name: app_working_dir
+    value: '$(System.DefaultWorkingDirectory)/app'
+
+stages:
+  - stage: BuildAndScan
+    displayName: 'Build and Scan'
+    jobs:
+      - job: TerraformValidateAndScan
+        displayName: 'Terraform Validate and tfsec'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+          - script: |
+              curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              tfsec $(tf_working_dir)
+            displayName: 'Run tfsec'
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+          - script: |
+              cd $(tf_working_dir)
+              terraform init -backend=false
+              terraform validate
+            displayName: 'Terraform Init and Validate'
+
+      - job: BuildApp
+        displayName: 'Build Python App'
+        steps:
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: '$(app_working_dir)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+              replaceExistingArchive: true
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/app.zip'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: Provision
+    displayName: 'Provision Infrastructure'
+    dependsOn: BuildAndScan
+    condition: succeeded()
+    jobs:
+      - job: TerraformApply
+        displayName: 'Terraform Apply'
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(tf_working_dir)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(tfStateResourceGroup)'
+              backendAzureRmStorageAccountName: '$(tfStateStorageAccount)'
+              backendAzureRmContainerName: '$(tfStateContainer)'
+              backendAzureRmKey: '$(tfStateKey)'
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(tf_working_dir)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(tf_working_dir)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+
+  - stage: Deploy
+    displayName: 'Deploy Application'
+    dependsOn: Provision
+    condition: succeeded()
+    jobs:
+      - job: DeployApp
+        displayName: 'Deploy App to Azure Web App'
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - task: AzureWebApp@1
+            displayName: 'Azure Web App Deploy'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'webAppLinux'
+              appName: '$(webAppName)' # From Variable Group or retrieved via script
+              package: '$(System.ArtifactsDirectory)/drop/app.zip'
+              runtimeStack: 'PYTHON|3.10'
+              startUpCommand: 'gunicorn --bind=0.0.0.0 --timeout 600 app:app'
